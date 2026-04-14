@@ -195,6 +195,26 @@ def tg_get_updates(token: str, offset: int, poll_timeout: int) -> dict:
         return {"ok": True, "result": []}
 
 
+def format_telegram_actor(user: dict) -> str:
+    """Return a human-readable approver identity for logs and messages."""
+    username = user.get("username")
+    if isinstance(username, str) and username:
+        return f"@{username}"
+
+    first_name = user.get("first_name")
+    last_name = user.get("last_name")
+    full_name = " ".join(part for part in (first_name, last_name) if part)
+    user_id = user.get("id")
+
+    if full_name and user_id is not None:
+        return f"{full_name} (id: {user_id})"
+    if full_name:
+        return full_name
+    if user_id is not None:
+        return f"user id {user_id}"
+    return "unknown user"
+
+
 # ---------------------------------------------------------------------------
 # Peer credential helpers (Linux SO_PEERCRED)
 # ---------------------------------------------------------------------------
@@ -726,14 +746,14 @@ async def telegram_poller(cfg: dict, store: RequestStore):
 
             cq_id = cq["id"]
             data_str = cq.get("data", "")
-            from_user = cq.get("from", {}).get("username", "unknown")
-            from_id = cq.get("from", {}).get("id")
+            from_user = cq.get("from", {})
+            from_id = from_user.get("id")
+            approver_display = format_telegram_actor(from_user)
 
             # Approvers are authorized by numeric Telegram user ID only.
             authorized_users = cfg.get("authorized_telegram_users", [])
             if from_id not in authorized_users:
-                logging.warning("Unauthorized approval attempt from @%s (id: %s)",
-                                from_user, from_id)
+                logging.warning("Unauthorized approval attempt from %s", approver_display)
                 await loop.run_in_executor(
                     None,
                     lambda t=token, i=cq_id: tg_answer_callback(t, i, "Not authorized.")
@@ -757,14 +777,15 @@ async def telegram_poller(cfg: dict, store: RequestStore):
                     None,
                     lambda t=token, i=cq_id: tg_answer_callback(t, i, "Executing...")
                 )
-                logging.info("Request %s APPROVED by @%s", req_token[:8], from_user)
+                logging.info("Request %s APPROVED by %s", req_token[:8], approver_display)
                 audit(cfg, {
                     "event": "approved",
                     "token": req_token[:8],
                     "agent_user": req.agent_user,
                     "argv": req.argv,
                     "run_as": req.run_as,
-                    "approved_by": from_user,
+                    "approved_by": approver_display,
+                    "approved_by_id": from_id,
                 })
                 store.remove(req_token)
 
@@ -780,7 +801,7 @@ async def telegram_poller(cfg: dict, store: RequestStore):
                 out_display = out[:400] + ("..." if len(out) > 400 else "")
                 out_display = html.escape(out_display)
                 summary = (
-                    f"<b>✅ Executed</b> (approved by @{html.escape(from_user)})\n"
+                    f"<b>✅ Executed</b> (approved by {html.escape(approver_display)})\n"
                     f"<code>{html.escape(' '.join(req.argv))}</code>\n"
                     f"Exit: <code>{rc}</code>\n"
                     f"<pre>{out_display}</pre>"
@@ -796,22 +817,23 @@ async def telegram_poller(cfg: dict, store: RequestStore):
                     None,
                     lambda t=token, i=cq_id: tg_answer_callback(t, i, "Denied.")
                 )
-                logging.info("Request %s DENIED by @%s", req_token[:8], from_user)
+                logging.info("Request %s DENIED by %s", req_token[:8], approver_display)
                 audit(cfg, {
                     "event": "denied",
                     "token": req_token[:8],
                     "agent_user": req.agent_user,
                     "argv": req.argv,
-                    "denied_by": from_user,
+                    "denied_by": approver_display,
+                    "denied_by_id": from_id,
                 })
                 store.remove(req_token)
                 _write_response(req.response_path, {
                     "status": "denied",
-                    "message": f"Denied by @{from_user}.",
+                    "message": f"Denied by {approver_display}.",
                 }, responses_dir)
                 if req.message_id:
                     summary = (
-                        f"<b>❌ Denied</b> by @{html.escape(from_user)}\n"
+                        f"<b>❌ Denied</b> by {html.escape(approver_display)}\n"
                         f"<code>{html.escape(' '.join(req.argv))}</code>"
                     )
                     await loop.run_in_executor(
