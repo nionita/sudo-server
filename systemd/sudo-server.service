@@ -40,10 +40,8 @@ NoNewPrivileges=no          # must be no — daemon forks subprocesses as root
 PrivateTmp=yes
 ProtectHome=read-only
 ProtectSystem=strict
-# Allow writing to log dir, socket dir, and response temp dir
-ReadWritePaths=/var/log/sudo-server /run/sudo-server /tmp/sudo-server-responses
-# Allow executing system commands (apt, systemctl, etc.)
-ReadWritePaths=/
+# Allow writing to log dir and run dir (socket + responses)
+ReadWritePaths=/var/log/sudo-server /run/sudo-server
 # Network access needed for Telegram API
 PrivateNetwork=no
 

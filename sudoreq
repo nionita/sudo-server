@@ -23,9 +23,7 @@ import json
 import os
 import socket
 import sys
-import tempfile
 import time
-from pathlib import Path
 
 DEFAULT_SOCKET = "/run/sudo-server/request.sock"
 DEFAULT_WAIT   = 300   # seconds to wait for approval
@@ -67,7 +65,11 @@ def send_request(sock_path: str, payload: dict) -> dict:
 
 
 def wait_for_response(response_path: str, timeout: int) -> dict:
-    """Poll the response file until it appears or timeout expires."""
+    """Poll the response file until it appears or timeout expires.
+
+    The response file is created and owned by the server (root).
+    We only read it — no deletion (the server garbage-collects).
+    """
     deadline = time.monotonic() + timeout
     interval = 0.5
     while time.monotonic() < deadline:
@@ -75,11 +77,6 @@ def wait_for_response(response_path: str, timeout: int) -> dict:
             try:
                 with open(response_path) as f:
                     data = json.load(f)
-                # Clean up
-                try:
-                    os.unlink(response_path)
-                except OSError:
-                    pass
                 return data
             except (json.JSONDecodeError, OSError):
                 pass  # file may be mid-write, retry
@@ -125,27 +122,17 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    # Resolve a temp file for the response (writable by root, readable by us)
-    # We create it first with our permissions so root can write to it.
-    tmp_dir = Path(tempfile.gettempdir()) / "sudo-server-responses"
-    tmp_dir.mkdir(mode=0o1777, exist_ok=True)  # sticky bit, world-writable
-
-    resp_file = str(tmp_dir / f"resp-{os.getpid()}-{int(time.time())}.json")
-    # Touch the file so it's owned by us; root will overwrite it
-    Path(resp_file).touch(mode=0o600)
-    # Make it world-writable so root can write back to it
-    os.chmod(resp_file, 0o622)
-
     sock_path = find_socket()
     cwd = args.cwd or os.getcwd()
     agent_user = getpass.getuser()
 
+    # agent_user is sent for display but the server ignores it —
+    # identity is verified via SO_PEERCRED on the Unix socket.
     payload = {
         "agent_user":    agent_user,
         "argv":          argv,
         "cwd":           cwd,
         "run_as":        args.run_as,
-        "response_path": resp_file,
     }
 
     print(f"sudoreq: sending request for: {' '.join(argv)}", file=sys.stderr)
@@ -162,6 +149,11 @@ def main():
         print(f"sudoreq: waiting up to {args.wait}s...", file=sys.stderr)
     else:
         fatal(f"Unexpected server response: {ack}")
+
+    # The server manages the response file — read its path from the ACK
+    resp_file = ack.get("response_path")
+    if not resp_file:
+        fatal("Server did not provide a response_path in ACK")
 
     result = wait_for_response(resp_file, args.wait)
     res_status = result.get("status")

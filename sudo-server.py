@@ -10,12 +10,17 @@ Runs as root under systemd.
 """
 
 import asyncio
+import grp
+import html
 import json
 import logging
 import os
+import pwd
 import secrets
+import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -26,6 +31,17 @@ from pathlib import Path
 from typing import Optional
 
 # ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Safe PATH for resolving commands — only system directories
+SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Linux SO_PEERCRED support for verifying client identity
+SO_PEERCRED = getattr(socket, 'SO_PEERCRED', 17)
+_PEERCRED_FMT = struct.Struct('3i')  # pid_t, uid_t, gid_t
+
+# ---------------------------------------------------------------------------
 # Configuration — loaded from /etc/sudo-server/config.json
 # All values can be overridden by environment variables (see load_config).
 # ---------------------------------------------------------------------------
@@ -33,11 +49,14 @@ from typing import Optional
 DEFAULT_CONFIG = {
     "socket_path":    "/run/sudo-server/request.sock",
     "socket_group":   "sudo-agents",
+    "responses_dir":  "/run/sudo-server/responses",
     "log_file":       "/var/log/sudo-server/sudo-server.log",
     "audit_log":      "/var/log/sudo-server/audit.log",
     "token_ttl":      300,          # seconds a pending approval token stays valid
     "max_output_len": 3000,         # chars of command output sent back via Telegram
     "poll_timeout":   30,           # Telegram long-poll timeout (seconds)
+    "max_pending_requests": 50,     # Max queued commands waiting for approval
+    "allowed_run_as": ["root"],     # Allowed users to run commands as
     # Allowlist: if non-empty, only these base command names are accepted.
     # Example: ["apt-get", "apt", "dpkg", "systemctl", "cp", "chown", "cat"]
     "command_allowlist": [],
@@ -45,6 +64,7 @@ DEFAULT_CONFIG = {
     # Overrides command_allowlist for that user if set.
     # Example: {"agent_web": ["apt-get", "apt"], "agent_dev": ["systemctl"]}
     "agent_allowlist": {},
+    "authorized_telegram_users": [], # Allowed approving users (empty = anyone in chat)
     # Telegram — MUST be set (env vars preferred over config file for secrets)
     "telegram_bot_token": "",       # or env SUDO_SERVER_TG_TOKEN
     "telegram_chat_id":  "",        # or env SUDO_SERVER_TG_CHAT_ID
@@ -175,6 +195,43 @@ def tg_get_updates(token: str, offset: int, poll_timeout: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Peer credential helpers (Linux SO_PEERCRED)
+# ---------------------------------------------------------------------------
+
+def get_peer_uid(writer: asyncio.StreamWriter) -> Optional[int]:
+    """Get the UID of the peer process via SO_PEERCRED (Linux only)."""
+    sock = writer.get_extra_info('socket')
+    if sock is None:
+        return None
+    try:
+        creds = sock.getsockopt(socket.SOL_SOCKET, SO_PEERCRED,
+                                _PEERCRED_FMT.size)
+        _pid, uid, _gid = _PEERCRED_FMT.unpack(creds)
+        return uid
+    except (OSError, struct.error):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Command resolution
+# ---------------------------------------------------------------------------
+
+def resolve_command(cmd: str) -> Optional[str]:
+    """Resolve a bare command name to its canonical absolute path.
+
+    Only bare names (no '/' or '.') are accepted. Resolution uses SAFE_PATH
+    to prevent agents from running arbitrary executables via path manipulation.
+    Returns the resolved canonical path, or None if rejected/not found.
+    """
+    if os.sep in cmd or cmd.startswith('.'):
+        return None  # reject paths — only bare command names allowed
+    resolved = shutil.which(cmd, path=SAFE_PATH)
+    if resolved:
+        return os.path.realpath(resolved)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Pending request store
 # ---------------------------------------------------------------------------
 
@@ -195,12 +252,16 @@ class PendingRequest:
 
 
 class RequestStore:
-    def __init__(self, ttl: int):
+    def __init__(self, ttl: int, responses_dir: str):
         self._store: dict[str, PendingRequest] = {}
         self._ttl = ttl
+        self._responses_dir = responses_dir
 
     def add(self, req: PendingRequest):
         self._store[req.token] = req
+
+    def size(self) -> int:
+        return len(self._store)
 
     def get(self, token: str) -> Optional[PendingRequest]:
         req = self._store.get(token)
@@ -221,9 +282,21 @@ class RequestStore:
             _write_response(req.response_path, {
                 "status": "expired",
                 "message": "Approval timed out.",
-            })
+            }, self._responses_dir)
             logging.info("Request %s expired (user=%s cmd=%s)",
                          t[:8], req.agent_user, req.argv[0])
+        # Garbage-collect old response files
+        self._cleanup_responses()
+
+    def _cleanup_responses(self):
+        """Remove response files older than TTL + 60s."""
+        try:
+            cutoff = time.time() - self._ttl - 60
+            for f in Path(self._responses_dir).iterdir():
+                if f.suffix == '.json' and f.stat().st_mtime < cutoff:
+                    f.unlink(missing_ok=True)
+        except Exception as e:
+            logging.debug("Response cleanup error: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -231,8 +304,12 @@ class RequestStore:
 # ---------------------------------------------------------------------------
 
 def validate_request(payload: dict, cfg: dict) -> tuple[bool, str]:
-    """Return (ok, error_message). Checks structure + allowlist."""
-    required = {"agent_user", "argv", "cwd", "run_as", "response_path"}
+    """Return (ok, error_message). Checks structure + allowlist.
+
+    Side effect: on success, replaces argv[0] with the resolved canonical path.
+    The agent_user field must be set by the caller (via SO_PEERCRED).
+    """
+    required = {"argv", "cwd", "run_as"}
     missing = required - payload.keys()
     if missing:
         return False, f"Missing fields: {missing}"
@@ -244,8 +321,28 @@ def validate_request(payload: dict, cfg: dict) -> tuple[bool, str]:
         if not isinstance(a, str):
             return False, "argv elements must be strings"
 
-    agent_user = payload["agent_user"]
-    base_cmd = os.path.basename(argv[0])
+    cwd = payload["cwd"]
+    if not isinstance(cwd, str) or not os.path.isabs(cwd) or ".." in cwd:
+        return False, "cwd must be an absolute path without traversal"
+
+    run_as = payload["run_as"]
+    if not isinstance(run_as, str):
+        return False, "run_as must be a string"
+    allowed_run_as = cfg.get("allowed_run_as", ["root"])
+    if run_as not in allowed_run_as:
+        return False, f"run_as '{run_as}' is not permitted"
+
+    # Resolve the command to a canonical path (bare names only)
+    resolved = resolve_command(argv[0])
+    if resolved is None:
+        return False, (
+            f"Command '{argv[0]}' rejected: only bare command names are accepted "
+            f"(no paths). The command must exist in the system PATH."
+        )
+    argv[0] = resolved
+    base_cmd = os.path.basename(resolved)
+
+    agent_user = payload.get("agent_user", "")
 
     # Per-agent allowlist takes precedence
     agent_al = cfg.get("agent_allowlist", {}).get(agent_user)
@@ -275,7 +372,7 @@ def validate_request(payload: dict, cfg: dict) -> tuple[bool, str]:
 def execute_command(req: PendingRequest, cfg: dict) -> dict:
     """Run the command and return a result dict."""
     env = {
-        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "PATH": SAFE_PATH,
         "HOME": f"/home/{req.run_as}" if req.run_as != "root" else "/root",
         "USER": req.run_as,
         "LOGNAME": req.run_as,
@@ -314,13 +411,27 @@ def execute_command(req: PendingRequest, cfg: dict) -> dict:
 # Response file helpers
 # ---------------------------------------------------------------------------
 
-def _write_response(path: str, data: dict):
-    """Write JSON result to the response file the agent is waiting on."""
+def _write_response(path: str, data: dict, responses_dir: str):
+    """Write JSON result to the response file the agent is waiting on.
+
+    Security: validates the path is under responses_dir and uses O_NOFOLLOW
+    to prevent symlink attacks.
+    """
+    # Defense-in-depth: ensure path is under the responses directory
+    real_path = os.path.realpath(path)
+    real_dir = os.path.realpath(responses_dir)
+    if not real_path.startswith(real_dir + os.sep):
+        logging.error("SECURITY: refusing to write response outside "
+                      "responses dir: %s (resolved: %s)", path, real_path)
+        return
     try:
         # Write to a temp file then rename for atomicity
         tmp = path + ".tmp"
-        with open(tmp, "w") as f:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                     0o640)
+        with os.fdopen(fd, "w") as f:
             json.dump(data, f)
+        os.chmod(tmp, 0o640)
         os.replace(tmp, path)
     except Exception as e:
         logging.error("Failed to write response to %s: %s", path, e)
@@ -338,39 +449,83 @@ async def handle_client(
     send_queue: asyncio.Queue,
 ):
     peer = writer.get_extra_info("peername")
+
+    # --- Issue 4: Verify agent identity via SO_PEERCRED ---
+    peer_uid = get_peer_uid(writer)
+    if peer_uid is None:
+        logging.warning("Rejected connection from %s: "
+                        "could not verify peer identity", peer)
+        writer.write(json.dumps({
+            "status": "error",
+            "message": "Could not verify peer identity (SO_PEERCRED failed)",
+        }).encode())
+        await writer.drain()
+        writer.close()
+        return
+
     try:
-        raw = await asyncio.wait_for(reader.read(4096), timeout=5)
+        agent_user = pwd.getpwuid(peer_uid).pw_name
+    except KeyError:
+        logging.warning("Rejected connection from %s: "
+                        "unknown UID %d", peer, peer_uid)
+        writer.write(json.dumps({
+            "status": "error",
+            "message": f"Unknown UID {peer_uid}",
+        }).encode())
+        await writer.drain()
+        writer.close()
+        return
+
+    try:
+        raw = await asyncio.wait_for(reader.read(1048576), timeout=5)
+        if len(raw) == 1048576:
+            raise ValueError("Payload too large (exceeds 1MB)")
         payload = json.loads(raw)
-    except (asyncio.TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as e:
-        logging.warning("Bad request from %s: %s", peer, e)
+    except (asyncio.TimeoutError, json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+        logging.warning("Bad request from %s (user=%s): %s", peer, agent_user, e)
         writer.write(json.dumps({"status": "error", "message": "Bad request"}).encode())
         await writer.drain()
         writer.close()
         return
 
+    # Override agent_user with kernel-verified identity (ignore client claim)
+    payload["agent_user"] = agent_user
+
     ok, err = validate_request(payload, cfg)
     if not ok:
-        logging.warning("Rejected request from %s: %s", peer, err)
+        logging.warning("Rejected request from %s (user=%s): %s",
+                        peer, agent_user, err)
         writer.write(json.dumps({"status": "rejected", "message": err}).encode())
         await writer.drain()
         writer.close()
         return
 
-    token = secrets.token_hex(8)  # 16 hex chars — short enough to type if needed
+    if store.size() >= cfg.get("max_pending_requests", 50):
+        logging.warning("Rejected request from %s: max pending requests reached", peer)
+        writer.write(json.dumps({"status": "rejected", "message": "Server busy (max pending requests)"}).encode())
+        await writer.drain()
+        writer.close()
+        return
+
+    token = secrets.token_hex(16)  # 32 hex chars
+    # --- Issue 1 & 2: Server creates the response file path ---
+    response_path = os.path.join(cfg["responses_dir"], f"{token}.json")
+
     req = PendingRequest(
         token=token,
-        agent_user=payload["agent_user"],
+        agent_user=agent_user,
         argv=payload["argv"],
         cwd=payload["cwd"],
         run_as=payload.get("run_as", "root"),
-        response_path=payload["response_path"],
+        response_path=response_path,
     )
     store.add(req)
 
-    # Acknowledge immediately so the client can start polling its response file
+    # Acknowledge with token and server-managed response path
     writer.write(json.dumps({
         "status": "pending",
         "token": token,
+        "response_path": response_path,
         "message": "Request queued, waiting for approval.",
     }).encode())
     await writer.drain()
@@ -386,6 +541,18 @@ async def run_socket_server(cfg: dict, store: RequestStore, send_queue: asyncio.
     sock_path = cfg["socket_path"]
     Path(sock_path).parent.mkdir(parents=True, exist_ok=True)
 
+    # --- Issue 1 & 2: Create server-managed responses directory ---
+    resp_dir = cfg["responses_dir"]
+    Path(resp_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        gid = grp.getgrnam(cfg["socket_group"]).gr_gid
+        os.chown(resp_dir, 0, gid)
+    except (KeyError, PermissionError) as e:
+        logging.warning("Could not set responses dir group '%s': %s",
+                        cfg["socket_group"], e)
+    # setgid (2) ensures new files inherit the group; 750 = rwxr-x---
+    os.chmod(resp_dir, 0o2750)
+
     # Remove stale socket
     try:
         os.unlink(sock_path)
@@ -399,7 +566,6 @@ async def run_socket_server(cfg: dict, store: RequestStore, send_queue: asyncio.
 
     # Set group ownership and permissions (0660)
     try:
-        import grp
         gid = grp.getgrnam(cfg["socket_group"]).gr_gid
         os.chown(sock_path, 0, gid)
     except (KeyError, PermissionError) as e:
@@ -418,6 +584,7 @@ async def run_socket_server(cfg: dict, store: RequestStore, send_queue: asyncio.
 async def telegram_sender(cfg: dict, store: RequestStore, send_queue: asyncio.Queue):
     token = cfg["telegram_bot_token"]
     chat_id = cfg["telegram_chat_id"]
+    responses_dir = cfg["responses_dir"]
     loop = asyncio.get_event_loop()
 
     while True:
@@ -425,11 +592,11 @@ async def telegram_sender(cfg: dict, store: RequestStore, send_queue: asyncio.Qu
         cmd_display = " ".join(req.argv)
         text = (
             f"<b>Sudo request</b>\n"
-            f"Agent: <code>{req.agent_user}</code>\n"
-            f"Run as: <code>{req.run_as}</code>\n"
-            f"CWD: <code>{req.cwd}</code>\n"
-            f"Command:\n<pre>{cmd_display}</pre>\n"
-            f"Token: <code>{req.token}</code>\n"
+            f"Agent: <code>{html.escape(req.agent_user)}</code>\n"
+            f"Run as: <code>{html.escape(req.run_as)}</code>\n"
+            f"CWD: <code>{html.escape(req.cwd)}</code>\n"
+            f"Command:\n<pre>{html.escape(cmd_display)}</pre>\n"
+            f"Token: <code>{html.escape(req.token)}</code>\n"
             f"Expires in {cfg['token_ttl']}s"
         )
         keyboard = [[
@@ -447,7 +614,7 @@ async def telegram_sender(cfg: dict, store: RequestStore, send_queue: asyncio.Qu
             _write_response(req.response_path, {
                 "status": "error",
                 "message": f"Telegram notification failed: {e}",
-            })
+            }, responses_dir)
             store.remove(req.token)
 
 
@@ -459,6 +626,7 @@ async def telegram_poller(cfg: dict, store: RequestStore):
     token = cfg["telegram_bot_token"]
     chat_id = str(cfg["telegram_chat_id"])
     poll_timeout = cfg["poll_timeout"]
+    responses_dir = cfg["responses_dir"]
     loop = asyncio.get_event_loop()
     offset = 0
 
@@ -498,6 +666,17 @@ async def telegram_poller(cfg: dict, store: RequestStore):
             cq_id = cq["id"]
             data_str = cq.get("data", "")
             from_user = cq.get("from", {}).get("username", "unknown")
+            from_id = cq.get("from", {}).get("id")
+
+            # Issue 5: Verify authorized Telegram users
+            authorized_users = cfg.get("authorized_telegram_users", [])
+            if authorized_users and not (from_id in authorized_users or from_user in authorized_users):
+                logging.warning("Unauthorized approval attempt from @%s (id: %s)", from_user, from_id)
+                await loop.run_in_executor(
+                    None,
+                    lambda t=token, i=cq_id: tg_answer_callback(t, i, "Not authorized.")
+                )
+                continue
 
             if ":" not in data_str:
                 continue
@@ -507,14 +686,14 @@ async def telegram_poller(cfg: dict, store: RequestStore):
             if req is None:
                 await loop.run_in_executor(
                     None,
-                    lambda: tg_answer_callback(token, cq_id, "Request not found or expired.")
+                    lambda t=token, i=cq_id: tg_answer_callback(t, i, "Request not found or expired.")
                 )
                 continue
 
             if action == "approve":
                 await loop.run_in_executor(
                     None,
-                    lambda: tg_answer_callback(token, cq_id, "Executing...")
+                    lambda t=token, i=cq_id: tg_answer_callback(t, i, "Executing...")
                 )
                 logging.info("Request %s APPROVED by @%s", req_token[:8], from_user)
                 audit(cfg, {
@@ -529,30 +708,31 @@ async def telegram_poller(cfg: dict, store: RequestStore):
 
                 # Execute in a thread so we don't block the event loop
                 result = await loop.run_in_executor(
-                    None, lambda: execute_command(req, cfg)
+                    None, lambda r=req, c=cfg: execute_command(r, c)
                 )
-                _write_response(req.response_path, result)
+                _write_response(req.response_path, result, responses_dir)
 
                 # Update the Telegram message
                 rc = result.get("returncode", "?")
                 out = result.get("output", result.get("message", ""))
                 out_display = out[:400] + ("..." if len(out) > 400 else "")
+                out_display = html.escape(out_display)
                 summary = (
-                    f"<b>✅ Executed</b> (approved by @{from_user})\n"
-                    f"<code>{'  '.join(req.argv)}</code>\n"
+                    f"<b>✅ Executed</b> (approved by @{html.escape(from_user)})\n"
+                    f"<code>{html.escape(' '.join(req.argv))}</code>\n"
                     f"Exit: <code>{rc}</code>\n"
                     f"<pre>{out_display}</pre>"
                 )
                 if req.message_id:
                     await loop.run_in_executor(
                         None,
-                        lambda: tg_edit(token, chat_id, req.message_id, summary)
+                        lambda t=token, c=chat_id, m=req.message_id, s=summary: tg_edit(t, c, m, s)
                     )
 
             elif action == "deny":
                 await loop.run_in_executor(
                     None,
-                    lambda: tg_answer_callback(token, cq_id, "Denied.")
+                    lambda t=token, i=cq_id: tg_answer_callback(t, i, "Denied.")
                 )
                 logging.info("Request %s DENIED by @%s", req_token[:8], from_user)
                 audit(cfg, {
@@ -566,15 +746,15 @@ async def telegram_poller(cfg: dict, store: RequestStore):
                 _write_response(req.response_path, {
                     "status": "denied",
                     "message": f"Denied by @{from_user}.",
-                })
+                }, responses_dir)
                 if req.message_id:
                     summary = (
-                        f"<b>❌ Denied</b> by @{from_user}\n"
-                        f"<code>{' '.join(req.argv)}</code>"
+                        f"<b>❌ Denied</b> by @{html.escape(from_user)}\n"
+                        f"<code>{html.escape(' '.join(req.argv))}</code>"
                     )
                     await loop.run_in_executor(
                         None,
-                        lambda: tg_edit(token, chat_id, req.message_id, summary)
+                        lambda t=token, c=chat_id, m=req.message_id, s=summary: tg_edit(t, c, m, s)
                     )
 
 
@@ -597,13 +777,32 @@ async def main():
     setup_logging(cfg)
     logging.info("sudo-server starting")
 
-    store = RequestStore(ttl=cfg["token_ttl"])
+    # Issue 17: Warn if config file has insecure permissions
+    if os.path.exists(CONFIG_FILE):
+        try:
+            st = os.stat(CONFIG_FILE)
+            if st.st_mode & 0o077:
+                logging.warning("SECURITY: %s is readable by group/others! "
+                                "It may contain secrets. Run: chmod 600 %s",
+                                CONFIG_FILE, CONFIG_FILE)
+        except OSError as e:
+            logging.warning("Could not stat config file: %s", e)
+
+    store = RequestStore(ttl=cfg["token_ttl"],
+                         responses_dir=cfg["responses_dir"])
     send_queue: asyncio.Queue = asyncio.Queue()
 
     loop = asyncio.get_event_loop()
 
     def _shutdown():
         logging.info("sudo-server shutting down")
+        # Issue 18: Graceful shutdown of pending requests
+        for token, req in list(store._store.items()):
+            _write_response(req.response_path, {
+                "status": "error",
+                "message": "Server shutting down."
+            }, cfg["responses_dir"])
+        store._store.clear()
         loop.stop()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
