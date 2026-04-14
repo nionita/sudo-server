@@ -1,0 +1,51 @@
+[Unit]
+Description=Sudo Server — Telegram-based privileged command approval daemon
+Documentation=https://github.com/yourorg/sudo-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sudo-server.py
+Restart=on-failure
+RestartSec=5
+User=root
+
+# --- Configuration ---
+# Required secrets — set here or in /etc/sudo-server/config.json
+# Prefer EnvironmentFile for secrets so they don't appear in 'systemctl status'
+EnvironmentFile=-/etc/sudo-server/env
+# Fallback: you can also set them inline (less secure, visible in process list):
+# Environment=SUDO_SERVER_TG_TOKEN=123456789:AAxxxxxxxxxxxxxxxxxxxxxxxx
+# Environment=SUDO_SERVER_TG_CHAT_ID=-100123456789
+
+# Optional overrides (all have defaults in config.json):
+# Environment=SUDO_SERVER_CONFIG=/etc/sudo-server/config.json
+# Environment=SUDO_SERVER_SOCKET=/run/sudo-server/request.sock
+# Environment=SUDO_SERVER_SOCKET_GROUP=sudo-agents
+# Environment=SUDO_SERVER_TOKEN_TTL=300
+
+# --- Runtime directory ---
+RuntimeDirectory=sudo-server
+RuntimeDirectoryMode=0755
+
+# --- Logging ---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sudo-server
+
+# --- Hardening ---
+# The daemon runs as root by necessity, but we restrict it as much as possible.
+NoNewPrivileges=no          # must be no — daemon forks subprocesses as root
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=strict
+# Allow writing to log dir, socket dir, and response temp dir
+ReadWritePaths=/var/log/sudo-server /run/sudo-server /tmp/sudo-server-responses
+# Allow executing system commands (apt, systemctl, etc.)
+ReadWritePaths=/
+# Network access needed for Telegram API
+PrivateNetwork=no
+
+[Install]
+WantedBy=multi-user.target

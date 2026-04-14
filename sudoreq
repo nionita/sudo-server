@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""
+sudoreq — client utility for agent users to request privileged command execution.
+
+Usage:
+  sudoreq [--as USER] [--cwd DIR] [--wait SECS] -- COMMAND [ARGS...]
+  sudoreq apt-get install ffmpeg
+  sudoreq --as www-data -- chown www-data /var/www/html/upload
+  sudoreq --wait 120 -- systemctl restart myservice
+
+No third-party dependencies. Requires only a Unix socket at the path
+configured in /etc/sudo-server/config.json (default: /run/sudo-server/request.sock).
+
+Exit codes:
+  0  Command was approved and ran with exit code 0
+  1  Command was denied, expired, or an error occurred
+  The actual command exit code is printed and also written to the response file.
+"""
+
+import argparse
+import getpass
+import json
+import os
+import socket
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+DEFAULT_SOCKET = "/run/sudo-server/request.sock"
+DEFAULT_WAIT   = 300   # seconds to wait for approval
+
+
+def find_socket() -> str:
+    """Resolve socket path from config or default."""
+    config_file = os.environ.get("SUDO_SERVER_CONFIG", "/etc/sudo-server/config.json")
+    if os.path.exists(config_file):
+        try:
+            with open(config_file) as f:
+                cfg = json.load(f)
+            if "socket_path" in cfg:
+                return cfg["socket_path"]
+        except Exception:
+            pass
+    return os.environ.get("SUDO_SERVER_SOCKET", DEFAULT_SOCKET)
+
+
+def send_request(sock_path: str, payload: dict) -> dict:
+    """Send a JSON request to the server, return the immediate acknowledgement."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        try:
+            s.connect(sock_path)
+        except FileNotFoundError:
+            fatal(f"Socket not found: {sock_path}\nIs sudo-server running?")
+        except PermissionError:
+            fatal(
+                f"Permission denied: {sock_path}\n"
+                f"Is your user in the 'sudo-agents' group?\n"
+                f"  sudo usermod -aG sudo-agents {getpass.getuser()}"
+            )
+        s.sendall(json.dumps(payload).encode())
+        s.shutdown(socket.SHUT_WR)
+        raw = b""
+        while chunk := s.recv(4096):
+            raw += chunk
+    return json.loads(raw)
+
+
+def wait_for_response(response_path: str, timeout: int) -> dict:
+    """Poll the response file until it appears or timeout expires."""
+    deadline = time.monotonic() + timeout
+    interval = 0.5
+    while time.monotonic() < deadline:
+        if os.path.exists(response_path):
+            try:
+                with open(response_path) as f:
+                    data = json.load(f)
+                # Clean up
+                try:
+                    os.unlink(response_path)
+                except OSError:
+                    pass
+                return data
+            except (json.JSONDecodeError, OSError):
+                pass  # file may be mid-write, retry
+        time.sleep(interval)
+    return {"status": "timeout", "message": "Timed out waiting for approval."}
+
+
+def fatal(msg: str):
+    print(f"sudoreq: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="sudoreq",
+        description="Request privileged command execution via sudo-server.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split("No third-party")[0].strip(),
+    )
+    parser.add_argument(
+        "--as", dest="run_as", default="root", metavar="USER",
+        help="Run command as this user (default: root)",
+    )
+    parser.add_argument(
+        "--cwd", default=None, metavar="DIR",
+        help="Working directory for the command (default: current dir)",
+    )
+    parser.add_argument(
+        "--wait", type=int, default=DEFAULT_WAIT, metavar="SECS",
+        help=f"Seconds to wait for approval (default: {DEFAULT_WAIT})",
+    )
+    parser.add_argument(
+        "argv", nargs=argparse.REMAINDER,
+        help="Command and arguments (use -- to separate from sudoreq options)",
+    )
+    args = parser.parse_args()
+
+    # Strip leading '--' separator
+    argv = args.argv
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        parser.print_help()
+        sys.exit(1)
+
+    # Resolve a temp file for the response (writable by root, readable by us)
+    # We create it first with our permissions so root can write to it.
+    tmp_dir = Path(tempfile.gettempdir()) / "sudo-server-responses"
+    tmp_dir.mkdir(mode=0o1777, exist_ok=True)  # sticky bit, world-writable
+
+    resp_file = str(tmp_dir / f"resp-{os.getpid()}-{int(time.time())}.json")
+    # Touch the file so it's owned by us; root will overwrite it
+    Path(resp_file).touch(mode=0o600)
+    # Make it world-writable so root can write back to it
+    os.chmod(resp_file, 0o622)
+
+    sock_path = find_socket()
+    cwd = args.cwd or os.getcwd()
+    agent_user = getpass.getuser()
+
+    payload = {
+        "agent_user":    agent_user,
+        "argv":          argv,
+        "cwd":           cwd,
+        "run_as":        args.run_as,
+        "response_path": resp_file,
+    }
+
+    print(f"sudoreq: sending request for: {' '.join(argv)}", file=sys.stderr)
+    ack = send_request(sock_path, payload)
+
+    status = ack.get("status")
+    if status == "rejected":
+        fatal(f"Request rejected: {ack.get('message', '')}")
+    elif status == "error":
+        fatal(f"Server error: {ack.get('message', '')}")
+    elif status == "pending":
+        token = ack.get("token", "")
+        print(f"sudoreq: pending approval (token: {token})", file=sys.stderr)
+        print(f"sudoreq: waiting up to {args.wait}s...", file=sys.stderr)
+    else:
+        fatal(f"Unexpected server response: {ack}")
+
+    result = wait_for_response(resp_file, args.wait)
+    res_status = result.get("status")
+
+    if res_status == "approved":
+        rc = result.get("returncode", 1)
+        output = result.get("output", "")
+        if output:
+            print(output)
+        sys.exit(0 if rc == 0 else rc)
+    elif res_status == "denied":
+        print(f"sudoreq: DENIED — {result.get('message', '')}", file=sys.stderr)
+        sys.exit(1)
+    elif res_status == "expired":
+        print(f"sudoreq: EXPIRED — {result.get('message', '')}", file=sys.stderr)
+        sys.exit(1)
+    elif res_status == "timeout":
+        print("sudoreq: timed out waiting for a response.", file=sys.stderr)
+        sys.exit(1)
+    elif res_status == "error":
+        print(f"sudoreq: execution error — {result.get('message', '')}", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print(f"sudoreq: unexpected response: {result}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
