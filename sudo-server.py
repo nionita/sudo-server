@@ -43,7 +43,8 @@ _PEERCRED_FMT = struct.Struct('3i')  # pid_t, uid_t, gid_t
 
 # ---------------------------------------------------------------------------
 # Configuration — loaded from /etc/sudo-server/config.json
-# All values can be overridden by environment variables (see load_config).
+# Only a subset of values are overridden by environment variables in load_config().
+# authorized_telegram_users remains config-file-only.
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
@@ -55,7 +56,7 @@ DEFAULT_CONFIG = {
     "token_ttl":      300,          # seconds a pending approval token stays valid
     "max_output_len": 3000,         # chars of command output sent back via Telegram
     "poll_timeout":   30,           # Telegram long-poll timeout (seconds)
-    "max_pending_requests": 50,     # Max queued commands waiting for approval
+    "max_pending_requests_per_agent": 5,  # Max queued commands per agent user
     "allowed_run_as": ["root"],     # Allowed users to run commands as
     # Allowlist: if non-empty, only these base command names are accepted.
     # Example: ["apt-get", "apt", "dpkg", "systemctl", "cp", "chown", "cat"]
@@ -64,7 +65,7 @@ DEFAULT_CONFIG = {
     # Overrides command_allowlist for that user if set.
     # Example: {"agent_web": ["apt-get", "apt"], "agent_dev": ["systemctl"]}
     "agent_allowlist": {},
-    "authorized_telegram_users": [], # Allowed approving users (empty = anyone in chat)
+    "authorized_telegram_users": [], # Allowed approver Telegram user IDs; config only
     # Telegram — MUST be set (env vars preferred over config file for secrets)
     "telegram_bot_token": "",       # or env SUDO_SERVER_TG_TOKEN
     "telegram_chat_id":  "",        # or env SUDO_SERVER_TG_CHAT_ID
@@ -263,6 +264,9 @@ class RequestStore:
     def size(self) -> int:
         return len(self._store)
 
+    def count_for_user(self, agent_user: str) -> int:
+        return sum(1 for req in self._store.values() if req.agent_user == agent_user)
+
     def get(self, token: str) -> Optional[PendingRequest]:
         req = self._store.get(token)
         if req and (time.monotonic() - req.created_at) > self._ttl:
@@ -363,6 +367,58 @@ def validate_request(payload: dict, cfg: dict) -> tuple[bool, str]:
         )
 
     return True, ""
+
+
+def validate_config(cfg: dict) -> list[str]:
+    """Return configuration errors that should stop startup."""
+    errors: list[str] = []
+
+    authorized_users = cfg.get("authorized_telegram_users")
+    if not isinstance(authorized_users, list) or not authorized_users:
+        errors.append(
+            "authorized_telegram_users must be a non-empty list of Telegram numeric user IDs"
+        )
+    else:
+        bad_ids = [uid for uid in authorized_users if type(uid) is not int]
+        if bad_ids:
+            errors.append(
+                "authorized_telegram_users entries must be JSON integers only "
+                f"(invalid: {bad_ids})"
+            )
+
+    global_al = cfg.get("command_allowlist", [])
+    if not isinstance(global_al, list) or any(not isinstance(cmd, str) for cmd in global_al):
+        errors.append("command_allowlist must be a list of strings")
+        global_al = []
+
+    agent_al = cfg.get("agent_allowlist", {})
+    if not isinstance(agent_al, dict):
+        errors.append("agent_allowlist must be an object mapping usernames to command lists")
+        agent_al = {}
+
+    effective_agent_lists = 0
+    for agent_user, commands in agent_al.items():
+        if str(agent_user).startswith("_"):
+            continue
+        if not isinstance(commands, list) or any(not isinstance(cmd, str) for cmd in commands):
+            errors.append(
+                f"agent_allowlist[{agent_user!r}] must be a list of strings"
+            )
+            continue
+        if commands:
+            effective_agent_lists += 1
+
+    if not global_al and effective_agent_lists == 0:
+        errors.append(
+            "At least one command restriction must be configured: set command_allowlist "
+            "or provide at least one non-empty agent_allowlist entry"
+        )
+
+    per_agent_cap = cfg.get("max_pending_requests_per_agent", 5)
+    if not isinstance(per_agent_cap, int) or per_agent_cap < 1:
+        errors.append("max_pending_requests_per_agent must be an integer >= 1")
+
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -500,9 +556,14 @@ async def handle_client(
         writer.close()
         return
 
-    if store.size() >= cfg.get("max_pending_requests", 50):
-        logging.warning("Rejected request from %s: max pending requests reached", peer)
-        writer.write(json.dumps({"status": "rejected", "message": "Server busy (max pending requests)"}).encode())
+    per_agent_cap = cfg.get("max_pending_requests_per_agent", 5)
+    if store.count_for_user(agent_user) >= per_agent_cap:
+        logging.warning("Rejected request from %s (user=%s): pending request cap reached",
+                        peer, agent_user)
+        writer.write(json.dumps({
+            "status": "rejected",
+            "message": f"Too many pending requests for {agent_user} (limit: {per_agent_cap})",
+        }).encode())
         await writer.drain()
         writer.close()
         return
@@ -668,10 +729,11 @@ async def telegram_poller(cfg: dict, store: RequestStore):
             from_user = cq.get("from", {}).get("username", "unknown")
             from_id = cq.get("from", {}).get("id")
 
-            # Issue 5: Verify authorized Telegram users
+            # Approvers are authorized by numeric Telegram user ID only.
             authorized_users = cfg.get("authorized_telegram_users", [])
-            if authorized_users and not (from_id in authorized_users or from_user in authorized_users):
-                logging.warning("Unauthorized approval attempt from @%s (id: %s)", from_user, from_id)
+            if from_id not in authorized_users:
+                logging.warning("Unauthorized approval attempt from @%s (id: %s)",
+                                from_user, from_id)
                 await loop.run_in_executor(
                     None,
                     lambda t=token, i=cq_id: tg_answer_callback(t, i, "Not authorized.")
@@ -776,6 +838,12 @@ async def main():
 
     setup_logging(cfg)
     logging.info("sudo-server starting")
+
+    config_errors = validate_config(cfg)
+    if config_errors:
+        for err in config_errors:
+            logging.error("Configuration error: %s", err)
+        sys.exit(1)
 
     # Issue 17: Warn if config file has insecure permissions
     if os.path.exists(CONFIG_FILE):

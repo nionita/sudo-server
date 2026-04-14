@@ -11,13 +11,13 @@
   "token_ttl":      300,
   "max_output_len": 3000,
   "poll_timeout":   30,
-  "max_pending_requests": 50,
+  "max_pending_requests_per_agent": 5,
 
   "allowed_run_as": ["root"],
 
   "_comment_allowlist": [
-    "If command_allowlist is empty ([]), ALL commands are allowed (after approval).",
-    "Recommended: list only what your agents actually need.",
+    "At startup, sudo-server requires at least one command restriction.",
+    "Use a non-empty command_allowlist or at least one non-empty agent_allowlist entry.",
     "agent_allowlist overrides command_allowlist for a specific user."
   ],
   "command_allowlist": [
@@ -40,13 +40,14 @@
     "Prefer setting secrets via /etc/sudo-server/env (EnvironmentFile in systemd)",
     "rather than hardcoding them here.",
     "telegram_bot_token: get from @BotFather on Telegram",
-    "telegram_chat_id:   your personal Telegram user ID (not username).",
-    "  To find it: message @userinfobot on Telegram, it replies with your ID.",
-    "  Use a negative ID (e.g. -100...) for a group/channel.",
-    "authorized_telegram_users: list of user IDs or usernames allowed to approve requests.",
-    "  If empty ([]), anyone in the chat can approve."
+    "telegram_chat_id: destination chat for approval prompts.",
+    "  In a private chat, this is usually your personal Telegram user ID.",
+    "  In a group or channel, this is the group/channel chat ID (for groups often negative, e.g. -100...).",
+    "authorized_telegram_users: non-empty list of numeric Telegram user IDs allowed to approve.",
+    "  This is separate from telegram_chat_id and has no environment-variable override.",
+    "  In a 1:1 chat, your user ID may appear both here and in SUDO_SERVER_TG_CHAT_ID."
   ],
   "telegram_bot_token": "",
   "telegram_chat_id":   "",
-  "authorized_telegram_users": []
+  "authorized_telegram_users": [123456789]
 }

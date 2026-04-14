@@ -48,7 +48,7 @@ sudo bash install.sh
 
 Follow the post-installation tasks:
 1. **Credentials:** Set `SUDO_SERVER_TG_TOKEN` and `SUDO_SERVER_TG_CHAT_ID` within `/etc/sudo-server/env`.
-2. **Access Control:** Modify `/etc/sudo-server/config.json`. Configure your `command_allowlist` carefully to restrict precisely what commands agents are authorized to submit. Add your Telegram ID to `authorized_telegram_users` to strictly authorize specific reviewers.
+2. **Access Control:** Modify `/etc/sudo-server/config.json`. Configure a non-empty `command_allowlist` or at least one non-empty `agent_allowlist` entry so the service does not start in fail-open mode. Set `authorized_telegram_users` to a non-empty list of numeric Telegram user IDs allowed to approve requests. This is separate from `telegram_chat_id`: `telegram_chat_id` selects where prompts are sent, while `authorized_telegram_users` controls who may approve them.
 3. **Agent User Inclusion:** Assign appropriate users to the secure access group:
    ```bash
    sudo usermod -aG sudo-agents agent_username
