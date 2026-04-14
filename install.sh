@@ -22,7 +22,7 @@ install -d -o root -g root -m 0755 /etc/sudo-server
 install -d -o root -g root -m 0750 /var/log/sudo-server
 
 if [[ ! -f /etc/sudo-server/config.json ]]; then
-  install -o root -g root -m 0640 "$SCRIPT_DIR/config.json.example" /etc/sudo-server/config.json
+  install -o root -g root -m 0600 "$SCRIPT_DIR/config.json.example" /etc/sudo-server/config.json
   echo "    Created /etc/sudo-server/config.json — edit before starting!"
 else
   echo "    /etc/sudo-server/config.json already exists, skipping."
